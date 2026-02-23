@@ -277,7 +277,7 @@ function printUsage() {
     "",
     "Optional:",
     "  --mode         chat | create (default: chat)",
-    "  --extension    jsx | tsx | js | ts",
+    "  --extension    jsx | tsx | js | ts | less | css | scss | sass",
     "  --call-path    Caller file path from project root (used for suggested import in create mode)",
     "  --output       Output directory or file path from project root (create mode only; defaults to project root)",
     "  --project-root Absolute project root (auto-detected if omitted)",
