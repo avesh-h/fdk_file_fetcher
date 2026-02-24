@@ -1,11 +1,13 @@
 ---
 name: fdk-file-fetcher
 description: Fetch one source file from fdk-react-templates and either return code in chat mode or create a local file in create mode.
+disable-model-invocation: true
 ---
 
 # FDK File Fetcher
 
 Use this skill when a user provides:
+
 - `File path`
 - `Extension`
 - `Call path`
@@ -16,6 +18,33 @@ It runs:
 
 ```bash
 node scripts/fdk_file_fetcher.js ...
+```
+
+## Help / Syntax Response Contract
+
+If the user asks things like:
+
+- "how can I use this skill?"
+- "what is the input format?"
+- "give me syntax"
+- "show example input"
+
+Do not run the script first. Reply with:
+
+1. Required fields
+2. Copy-paste input template
+3. One chat-mode example
+4. One create-mode example
+5. Supported extensions list
+
+Use this exact template block:
+
+```txt
+File path : "fdk-react-templates/page-layouts/single-checkout/shipment/single-page-shipment"
+Extension : "jsx"
+Call path : "theme/page-layouts/single-checkout/checkout/checkout.jsx"
+mode : "chat" | "create" (default: "chat")
+Output : "theme/page-layouts/single-checkout" (optional, only for "create" mode)
 ```
 
 ## Execution Marker
@@ -83,5 +112,5 @@ node scripts/fdk_file_fetcher.js \
 - If `mode` is missing, default to `chat`
 - In `create` mode, if `Output` is missing, file is created at project root
 - If `Output` is a directory, created filename is derived from import basename + extension
-- If required details are missing or invalid, show the expected user input format template
+- If required details are missing or invalid, show the expected user input format template and ask user to resend in the same structure
 - Supported extensions: `jsx`, `tsx`, `js`, `ts`, `less`, `css`, `scss`, `sass`
