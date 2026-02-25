@@ -4,10 +4,6 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 
-const PACKAGE_NAME = "fdk-react-templates";
-const GITHUB_OWNER = "gofynd";
-const GITHUB_REPO = "fdk-react-templates";
-const SOURCE_PREFIX = "src";
 const CODE_EXTENSIONS = [
   "jsx",
   "tsx",
@@ -55,7 +51,7 @@ function announce(message) {
 function expectedInputFormat() {
   return [
     "Expected input format:",
-    'File path : "fdk-react-templates/page-layouts/single-checkout/shipment/single-page-shipment"',
+    'File path : "@gofynd/theme-template/page-layouts/single-checkout/shipment/single-page-shipment"',
     'Extension : "jsx"',
     'Call path : "theme/page-layouts/single-checkout/checkout/checkout.jsx"',
     'mode : "chat" | "create" (default: "chat")',
@@ -69,6 +65,13 @@ function failWithFormat(message, exitCode = 1) {
 
 function toPosix(p) {
   return String(p || "").replace(/\\/g, "/");
+}
+
+function normalizePathForMatch(p) {
+  return toPosix(String(p || ""))
+    .replace(/^\.?\//, "")
+    .replace(/\/+/g, "/")
+    .toLowerCase();
 }
 
 function httpGet(url, headers) {
@@ -95,7 +98,7 @@ function httpGet(url, headers) {
           }
           resolve(body);
         });
-      }
+      },
     );
 
     req.on("error", reject);
@@ -106,17 +109,28 @@ function httpGet(url, headers) {
   });
 }
 
-async function githubListDir(dirPath, ref, token) {
-  const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${dirPath}?ref=${ref}`;
-  const headers = { Accept: "application/vnd.github.v3+json" };
-  if (token) headers.Authorization = `token ${token}`;
+async function fetchJson(url, headers) {
   const body = await httpGet(url, headers);
-  const items = JSON.parse(body);
-  return Array.isArray(items) ? items : [];
+  return JSON.parse(body);
 }
 
-async function githubGetRaw(filePath, ref, token) {
-  const url = `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${ref}/${filePath}`;
+async function githubRepoMeta(owner, repo, token) {
+  const url = `https://api.github.com/repos/${owner}/${repo}`;
+  const headers = { Accept: "application/vnd.github.v3+json" };
+  if (token) headers.Authorization = `token ${token}`;
+  return fetchJson(url, headers);
+}
+
+async function githubTree(owner, repo, ref, token) {
+  const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(ref)}?recursive=1`;
+  const headers = { Accept: "application/vnd.github.v3+json" };
+  if (token) headers.Authorization = `token ${token}`;
+  const data = await fetchJson(url, headers);
+  return Array.isArray(data?.tree) ? data.tree : [];
+}
+
+async function githubGetRaw(owner, repo, filePath, ref, token) {
+  const url = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/${filePath}`;
   const headers = {};
   if (token) headers.Authorization = `token ${token}`;
   return httpGet(url, headers);
@@ -125,16 +139,7 @@ async function githubGetRaw(filePath, ref, token) {
 function detectProjectRoot() {
   let dir = process.cwd();
   for (let i = 0; i < 20; i++) {
-    const pkgPath = path.join(dir, "package.json");
-    if (fs.existsSync(pkgPath)) {
-      try {
-        const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
-        const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-        if (deps[PACKAGE_NAME]) return dir;
-      } catch {
-        // Ignore parse issues and keep walking up
-      }
-    }
+    if (fs.existsSync(path.join(dir, "package.json"))) return dir;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -142,20 +147,23 @@ function detectProjectRoot() {
   return process.cwd();
 }
 
-function readCommitHash(projectRoot) {
+function readLockData(projectRoot) {
   const lockPath = path.join(projectRoot, "package-lock.json");
   if (!fs.existsSync(lockPath)) return null;
   try {
-    const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-    const entry =
-      lock?.packages?.[`node_modules/${PACKAGE_NAME}`] ||
-      lock?.dependencies?.[PACKAGE_NAME];
-    if (!entry?.resolved) return null;
-    const m = String(entry.resolved).match(/#([a-f0-9]+)$/);
-    return m ? m[1] : null;
+    return JSON.parse(fs.readFileSync(lockPath, "utf8"));
   } catch {
     return null;
   }
+}
+
+function getLockEntry(lockData, packageName) {
+  if (!lockData || !packageName) return null;
+  return (
+    lockData?.packages?.[`node_modules/${packageName}`] ||
+    lockData?.dependencies?.[packageName] ||
+    null
+  );
 }
 
 function normalizeExtension(ext) {
@@ -164,78 +172,284 @@ function normalizeExtension(ext) {
   return cleaned || null;
 }
 
-async function resolveFileInRepo(packagePath, ref, token, requestedExt) {
-  const fullPath = `${SOURCE_PREFIX}/${packagePath}`;
-  const dirPart = path.posix.dirname(fullPath);
-  const baseName = path.posix.basename(fullPath);
-  const baseExt = normalizeExtension(path.posix.extname(baseName));
-  const baseNoExt = baseExt
-    ? baseName.slice(0, -1 * (baseExt.length + 1))
-    : baseName;
+function parseImportPath(importPath) {
+  const trimmed = stripQuotes(importPath);
+  const parts = trimmed.split("/").filter(Boolean);
+  if (!parts.length) return null;
+  let packageName = parts[0];
+  let filePathParts = parts.slice(1);
+  if (trimmed.startsWith("@")) {
+    if (parts.length < 3) return null;
+    packageName = `${parts[0]}/${parts[1]}`;
+    filePathParts = parts.slice(2);
+  }
+  const filePath = filePathParts.join("/");
+  if (!filePath) return null;
+  return { packageName, filePath };
+}
 
-  const entries = await githubListDir(dirPart, ref, token);
-  const byName = new Map(entries.map((entry) => [entry.name, entry]));
+function parseGithubRepo(value) {
+  if (!value) return null;
+  const raw = String(value)
+    .replace(/^git\+/, "")
+    .replace(/^git:\/\//, "https://")
+    .replace(/^ssh:\/\/git@/, "https://")
+    .replace(/^git@github\.com:/, "https://github.com/")
+    .trim();
+  const m = raw.match(
+    /github\.com\/([^/]+)\/([^/#?]+?)(?:\.git)?(?:[/?].*)?(?:#(.+))?$/i,
+  );
+  if (!m) return null;
+  return { owner: m[1], repo: m[2], ref: m[3] || null };
+}
 
+function parseRefFromResolved(resolved) {
+  if (!resolved) return null;
+  const m = String(resolved).match(/#([A-Za-z0-9._/-]+)$/);
+  return m ? m[1] : null;
+}
+
+function getRepositoryUrl(repoField) {
+  if (!repoField) return null;
+  if (typeof repoField === "string") return repoField;
+  if (typeof repoField === "object" && repoField.url) return repoField.url;
+  return null;
+}
+
+function uniqueNonEmpty(values) {
+  return [...new Set(values.filter(Boolean).map((v) => String(v).trim()))];
+}
+
+function extractGithubRepoFromReadme(readme) {
+  if (!readme || typeof readme !== "string") return null;
+  const m = readme.match(/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/i);
+  if (!m) return null;
+  return parseGithubRepo(`https://github.com/${m[1]}`);
+}
+
+function scorePathMatch(candidatePath, wantedPath, requestedExt, sourcePrefix) {
+  const c = normalizePathForMatch(candidatePath);
+  const w = normalizePathForMatch(wantedPath);
+  const cBase = path.posix.basename(c);
+  const wBase = path.posix.basename(w);
+  const cNoExt = cBase.replace(/\.[^.]+$/, "");
+  const wNoExt = wBase.replace(/\.[^.]+$/, "");
+  const cExt = normalizeExtension(path.posix.extname(cBase));
+
+  let score = 0;
+  if (c === w) score = 120;
+  else if (c.startsWith(`${w}.`)) score = 110;
+  else if (c.endsWith(`/${w}`)) score = 95;
+  else if (c.endsWith(`/${wNoExt}`)) score = 90;
+  else if (cNoExt === wNoExt) score = 80;
+  else if (cBase.includes(wNoExt)) score = 60;
+
+  if (requestedExt && cExt === requestedExt) score += 20;
+  if (sourcePrefix && c.startsWith(`${normalizePathForMatch(sourcePrefix)}/`)) {
+    score += 8;
+  }
+
+  const wantedSegments = w.split("/").filter(Boolean);
+  const candidateSegments = c.split("/").filter(Boolean);
+  let aligned = 0;
+  for (
+    let i = 0;
+    i < Math.min(wantedSegments.length, candidateSegments.length);
+    i++
+  ) {
+    if (
+      wantedSegments[wantedSegments.length - 1 - i] ===
+      candidateSegments[candidateSegments.length - 1 - i]
+    ) {
+      aligned += 1;
+    } else {
+      break;
+    }
+  }
+  score += Math.min(aligned * 5, 20);
+  return score;
+}
+
+function pickBestTreeFile(treeItems, wantedPath, requestedExt, sourcePrefix) {
+  const files = treeItems.filter((item) => item?.type === "blob" && item?.path);
+  const scored = files
+    .map((item) => {
+      const ext = normalizeExtension(path.posix.extname(item.path));
+      if (requestedExt && ext !== requestedExt) return null;
+      if (!requestedExt && ext && !CODE_EXTENSIONS.includes(ext)) return null;
+      return {
+        path: item.path,
+        score: scorePathMatch(
+          item.path,
+          wantedPath,
+          requestedExt,
+          sourcePrefix,
+        ),
+      };
+    })
+    .filter(Boolean)
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+  return scored.length ? scored[0].path : null;
+}
+
+async function fetchNpmMetadata(packageName) {
+  const encodedName = packageName.startsWith("@")
+    ? packageName.replace("/", "%2f")
+    : packageName;
+  const url = `https://registry.npmjs.org/${encodedName}`;
+  return fetchJson(url, {});
+}
+
+function readInstalledPackageJson(projectRoot, packageName) {
+  const pkgPath = path.join(
+    projectRoot,
+    "node_modules",
+    ...packageName.split("/"),
+    "package.json",
+  );
+  if (!fs.existsSync(pkgPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function resolveRepoAndRefs({
+  packageName,
+  projectRoot,
+  lockData,
+  manualRepo,
+  manualRef,
+  preferLatest,
+  token,
+}) {
+  const lockEntry = getLockEntry(lockData, packageName) || {};
+  const resolved = lockEntry?.resolved || "";
+  const lockParsed = parseGithubRepo(resolved);
+  const lockRef = parseRefFromResolved(resolved);
+  const version = lockEntry?.version || null;
+  const installedPkg = readInstalledPackageJson(projectRoot, packageName);
+
+  let repoInfo = null;
+  const manualRepoInfo = manualRepo ? parseGithubRepo(manualRepo) : null;
+  const installedRepoInfo = installedPkg
+    ? parseGithubRepo(getRepositoryUrl(installedPkg.repository))
+    : null;
+
+  let npmData = null;
+  try {
+    npmData = await fetchNpmMetadata(packageName);
+  } catch {
+    // ignore registry errors; fallback to local-only mode
+  }
+
+  const latest = npmData?.["dist-tags"]?.latest;
+  const npmRootRepo = parseGithubRepo(getRepositoryUrl(npmData?.repository));
+  const npmVersionRepo = parseGithubRepo(
+    getRepositoryUrl(npmData?.versions?.[latest]?.repository),
+  );
+  const npmReadmeRepo = extractGithubRepoFromReadme(npmData?.readme);
+
+  const repoCandidates = preferLatest
+    ? [
+        manualRepoInfo,
+        npmRootRepo,
+        npmVersionRepo,
+        npmReadmeRepo,
+        lockParsed,
+        installedRepoInfo,
+      ]
+    : [
+        manualRepoInfo,
+        lockParsed,
+        installedRepoInfo,
+        npmRootRepo,
+        npmVersionRepo,
+        npmReadmeRepo,
+      ];
+
+  repoInfo = repoCandidates.find(Boolean) || null;
+
+  if (!repoInfo) return null;
+
+  let defaultBranch = null;
+  try {
+    const meta = await githubRepoMeta(repoInfo.owner, repoInfo.repo, token);
+    defaultBranch = meta?.default_branch || null;
+  } catch {
+    // ignore
+  }
+
+  const installedVersion = installedPkg?.version || null;
+  const effectiveVersion = installedVersion || version;
+
+  const stableRefs = uniqueNonEmpty([
+    manualRef,
+    lockRef,
+    repoInfo.ref,
+    effectiveVersion ? `v${effectiveVersion}` : null,
+    effectiveVersion,
+  ]);
+  const branchRefs = uniqueNonEmpty([defaultBranch, "main", "master"]);
+  const refs = preferLatest
+    ? uniqueNonEmpty([...branchRefs, ...stableRefs])
+    : uniqueNonEmpty([...stableRefs, ...branchRefs]);
+
+  return {
+    owner: repoInfo.owner,
+    repo: repoInfo.repo,
+    refs,
+  };
+}
+
+async function resolveFromGithub({
+  repoInfo,
+  packageFilePath,
+  requestedExt,
+  sourcePrefix,
+  token,
+}) {
+  if (!repoInfo) return null;
+  for (const ref of repoInfo.refs) {
+    try {
+      const tree = await githubTree(repoInfo.owner, repoInfo.repo, ref, token);
+      const targetPath = pickBestTreeFile(
+        tree,
+        packageFilePath,
+        requestedExt,
+        sourcePrefix,
+      );
+      if (!targetPath) continue;
+      const content = await githubGetRaw(
+        repoInfo.owner,
+        repoInfo.repo,
+        targetPath,
+        ref,
+        token,
+      );
+      return {
+        content,
+        repoPath: targetPath,
+        ref,
+        owner: repoInfo.owner,
+        repo: repoInfo.repo,
+        source: "github",
+      };
+    } catch {
+      // try next ref
+    }
+  }
+  return null;
+}
+
+function validateRequestedExtension(requestedExt) {
   if (requestedExt && !CODE_EXTENSIONS.includes(requestedExt)) {
     throw new Error(
-      `Unsupported extension "${requestedExt}". Use one of: ${CODE_EXTENSIONS.join(", ")}`
+      `Unsupported extension "${requestedExt}". Use one of: ${CODE_EXTENSIONS.join(", ")}`,
     );
   }
-
-  const tryFile = (name) => {
-    const entry = byName.get(name);
-    if (entry && entry.type === "file") {
-      return path.posix.join(dirPart, name);
-    }
-    return null;
-  };
-
-  if (requestedExt) {
-    const direct =
-      baseExt && baseExt === requestedExt
-        ? tryFile(baseName)
-        : tryFile(`${baseNoExt}.${requestedExt}`);
-    if (direct) return direct;
-  }
-
-  if (baseExt && CODE_EXTENSIONS.includes(baseExt)) {
-    const direct = tryFile(baseName);
-    if (direct) return direct;
-  }
-
-  if (!requestedExt) {
-    for (const ext of CODE_EXTENSIONS) {
-      const direct = tryFile(`${baseNoExt}.${ext}`);
-      if (direct) return direct;
-    }
-  }
-
-  const maybeDir = byName.get(baseNoExt);
-  if (maybeDir && maybeDir.type === "dir") {
-    const subDir = path.posix.join(dirPart, baseNoExt);
-    const subEntries = await githubListDir(subDir, ref, token);
-    const subByName = new Map(subEntries.map((entry) => [entry.name, entry]));
-
-    const tryIndex = (ext) => {
-      const indexName = `index.${ext}`;
-      const entry = subByName.get(indexName);
-      return entry && entry.type === "file"
-        ? path.posix.join(subDir, indexName)
-        : null;
-    };
-
-    if (requestedExt) {
-      const withExt = tryIndex(requestedExt);
-      if (withExt) return withExt;
-    } else {
-      for (const ext of CODE_EXTENSIONS) {
-        const withExt = tryIndex(ext);
-        if (withExt) return withExt;
-      }
-    }
-  }
-
-  return null;
 }
 
 function buildOutputFile(
@@ -243,7 +457,7 @@ function buildOutputFile(
   outputPath,
   importPath,
   resolvedRepoPath,
-  ext
+  ext,
 ) {
   const cleanedOutput = stripQuotes(outputPath);
   const outputBase = cleanedOutput
@@ -273,7 +487,7 @@ function printUsage() {
     "  node scripts/fdk_file_fetcher.js --file-path <import-path> [options]",
     "",
     "Required:",
-    '  --file-path    e.g. "fdk-react-templates/page-layouts/single-checkout/shipment/single-page-shipment"',
+    '  --file-path    e.g. "@gofynd/theme-template/page-layouts/single-checkout/shipment/single-page-shipment"',
     "",
     "Optional:",
     "  --mode         chat | create (default: chat)",
@@ -281,6 +495,10 @@ function printUsage() {
     "  --call-path    Caller file path from project root (used for suggested import in create mode)",
     "  --output       Output directory or file path from project root (create mode only; defaults to project root)",
     "  --project-root Absolute project root (auto-detected if omitted)",
+    "  --repo         Optional GitHub repo URL override, e.g. https://github.com/org/repo",
+    "  --ref          Optional Git ref override (commit/tag/branch)",
+    "  --prefer-latest Prefer npm latest metadata + main/master branch first",
+    "  --source-prefix Optional source root preference (e.g. src)",
     "  --github-token Optional GitHub token (or use GITHUB_TOKEN env)",
   ].join("\n");
   process.stdout.write(`${help}\n`);
@@ -300,48 +518,66 @@ async function main() {
 
   const importPath = stripQuotes(args["file-path"] || args.filePath || "");
   if (!importPath) {
-    failWithFormat('Missing --file-path. Expected "fdk-react-templates/...".');
-  }
-
-  if (!importPath.startsWith(`${PACKAGE_NAME}/`)) {
     failWithFormat(
-      `--file-path must start with "${PACKAGE_NAME}/". Received: "${importPath}"`
+      'Missing --file-path. Expected "<package>/<path>" or "@scope/package/<path>".',
     );
   }
 
-  announce(`Executing skill in "${mode}" mode for "${importPath}"`);
+  const parsedImport = parseImportPath(importPath);
+  if (!parsedImport) {
+    failWithFormat(`Invalid --file-path "${importPath}".`);
+  }
+  const { packageName, filePath: packageFilePath } = parsedImport;
+
+  announce(
+    `Executing skill in "${mode}" mode for "${importPath}" (package: ${packageName})`,
+  );
 
   const projectRoot =
     stripQuotes(args["project-root"] || "") || detectProjectRoot();
-  const commitHash = readCommitHash(projectRoot);
-  if (!commitHash) {
-    fail(
-      `Could not find ${PACKAGE_NAME} commit hash in ${path.join(projectRoot, "package-lock.json")}.`
+  const lockData = readLockData(projectRoot);
+  if (!lockData) {
+    announce(
+      "package-lock.json not found or unreadable. Will continue with remote metadata resolution.",
     );
   }
 
   const requestedExt = normalizeExtension(stripQuotes(args.extension || ""));
-  const packagePath = importPath.slice(`${PACKAGE_NAME}/`.length);
+  validateRequestedExtension(requestedExt);
+  const sourcePrefix = stripQuotes(args["source-prefix"] || "") || null;
   const token =
     stripQuotes(args["github-token"] || "") || process.env.GITHUB_TOKEN || null;
+  const manualRepo = stripQuotes(args.repo || "");
+  const manualRef = stripQuotes(args.ref || "");
+  const preferLatest = args["prefer-latest"] === true;
 
-  const repoPath = await resolveFileInRepo(
-    packagePath,
-    commitHash,
+  const repoInfo = await resolveRepoAndRefs({
+    packageName,
+    projectRoot,
+    lockData,
+    manualRepo,
+    manualRef,
+    preferLatest,
     token,
-    requestedExt
-  );
-  if (!repoPath) {
+  });
+
+  let resolved = await resolveFromGithub({
+    repoInfo,
+    packageFilePath,
+    requestedExt,
+    sourcePrefix,
+    token,
+  });
+
+  if (!resolved) {
     fail(
-      `Could not resolve source for "${importPath}" in ${GITHUB_OWNER}/${GITHUB_REPO}@${commitHash.slice(0, 8)}.`
+      `Could not resolve source for "${importPath}" from remote GitHub source for package "${packageName}".`,
     );
   }
 
-  const content = await githubGetRaw(repoPath, commitHash, token);
-
   if (mode === "chat") {
     announce("Returning source code in chat mode");
-    process.stdout.write(content);
+    process.stdout.write(resolved.content);
     return;
   }
 
@@ -349,20 +585,23 @@ async function main() {
     projectRoot,
     args.output,
     importPath,
-    repoPath,
-    requestedExt
+    resolved.repoPath,
+    requestedExt,
   );
   fs.mkdirSync(path.dirname(outputFile), { recursive: true });
-  fs.writeFileSync(outputFile, content, "utf8");
+  fs.writeFileSync(outputFile, resolved.content, "utf8");
 
   const callPath = stripQuotes(args["call-path"] || "");
   const response = {
     mode: "create",
+    packageName,
     importPath,
-    repoPath,
-    commitHash: commitHash.slice(0, 8),
+    repoPath: resolved.repoPath,
+    ref: resolved.ref,
+    source: resolved.source,
+    repo: resolved.owner ? `${resolved.owner}/${resolved.repo}` : resolved.repo,
     outputFile: toPosix(path.relative(projectRoot, outputFile)),
-    bytes: content.length,
+    bytes: resolved.content.length,
   };
 
   if (callPath) {

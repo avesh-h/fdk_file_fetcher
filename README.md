@@ -2,10 +2,10 @@
 
 ## Problem Statement
 
-In Fynd storefront projects, many components are imported from `fdk-react-templates`, for example:
+In modern storefront projects, components are often imported from package libraries, for example:
 
 ```js
-import SinglePageShipment from "fdk-react-templates/page-layouts/single-checkout/shipment/single-page-shipment";
+import SinglePageShipment from "@gofynd/theme-template/page-layouts/single-checkout/shipment/single-page-shipment";
 ```
 
 When you want to customize such a component, you need its original source code. Manually finding the correct file in GitHub every time is slow and error-prone.
@@ -13,8 +13,8 @@ When you want to customize such a component, you need its original source code. 
 This skill + script solves that by:
 
 1. Taking an import-style file path as input.
-2. Resolving the exact installed package commit from `package-lock.json`.
-3. Fetching the matching source file from `gofynd/fdk-react-templates`.
+2. Resolving package metadata dynamically from lockfile + installed dependencies.
+3. Fetching the matching source file from the package's GitHub repository when available.
 4. Returning code in chat mode or creating a local file in create mode.
 
 ## Solution Overview
@@ -28,8 +28,8 @@ This implementation has two connected parts:
 
 2. `scripts/fdk_file_fetcher.js` (execution engine):
    - Parses CLI input.
-   - Resolves version from lockfile.
-   - Calls GitHub APIs.
+   - Resolves package/repo/ref dynamically.
+   - Calls GitHub APIs (remote source only).
    - Returns source code (`chat`) or writes file (`create`).
 
 ## How They Are Connected
@@ -45,6 +45,7 @@ node scripts/fdk_file_fetcher.js ...
 - Script executes fetch/write logic and returns output.
 
 So:
+
 - `SKILL.md` = orchestration/instructions.
 - `fdk_file_fetcher.js` = real implementation.
 
@@ -53,7 +54,7 @@ So:
 Use this structure in agent chat:
 
 ```txt
-File path : "fdk-react-templates/page-layouts/single-checkout/shipment/single-page-shipment"
+File path : "@gofynd/theme-template/page-layouts/single-checkout/shipment/single-page-shipment"
 Extension : "jsx"
 Call path : "theme/page-layouts/single-checkout/checkout/checkout.jsx"
 mode : "chat" | "create"
@@ -61,6 +62,7 @@ Output : "theme/page-layouts/single-checkout"
 ```
 
 Meaning:
+
 - `File path`: package file you want to fetch.
 - `Extension`: target extension (`jsx`, `tsx`, `js`, `ts`, `less`, `css`, `scss`, `sass`).
 - `Call path`: local storefront file where import is used.
@@ -68,6 +70,11 @@ Meaning:
   - `chat` (default): return code only.
   - `create`: create a local file.
 - `Output`: output path from project root (optional in create mode).
+- Optional advanced inputs:
+  - `Repo`: force GitHub repo URL override.
+  - `Ref`: force branch/tag/commit override.
+  - `Prefer latest`: use npm latest metadata and try `main/master` first.
+  - `Source prefix`: prefer root like `src`.
 
 ## Modes
 
@@ -81,22 +88,23 @@ Example:
 
 ```bash
 node scripts/fdk_file_fetcher.js \
-  --file-path "fdk-react-templates/page-layouts/single-checkout/shipment/single-page-shipment" \
+  --file-path "@gofynd/theme-template/page-layouts/single-checkout/shipment/single-page-shipment" \
   --extension "jsx" \
   --call-path "theme/page-layouts/single-checkout/checkout/checkout.jsx" \
-  --mode "chat"
+  --mode "chat" \
+  --prefer-latest
 ```
 
 ### 2) Create Mode
 
 - Fetches source and writes a file locally.
-- Returns JSON summary (`outputFile`, `commitHash`, optional `suggestedLocalImport`).
+- Returns JSON summary (`outputFile`, `source`, `repo`, `ref`, optional `suggestedLocalImport`).
 
 Example:
 
 ```bash
 node scripts/fdk_file_fetcher.js \
-  --file-path "fdk-react-templates/page-layouts/single-checkout/shipment/single-page-shipment" \
+  --file-path "@gofynd/theme-template/page-layouts/single-checkout/shipment/single-page-shipment" \
   --extension "jsx" \
   --call-path "theme/page-layouts/single-checkout/checkout/checkout.jsx" \
   --mode "create" \
@@ -121,19 +129,27 @@ node scripts/fdk_file_fetcher.js \
 
 - Node.js available.
 - Internet access (script fetches from GitHub).
-- `package-lock.json` present with `fdk-react-templates` resolved commit.
+- `package-lock.json` recommended for best package/ref resolution.
 
-## Why `package-lock.json` Is Used
+## How Dynamic Resolution Works
 
-The script does not fetch arbitrary latest code. It fetches source from the exact commit installed in your project. This avoids version mismatch between your running storefront and fetched source.
+The script tries this order:
+
+1. Parse package name/path from `File path`.
+2. Read package info from `package-lock.json`.
+3. Read installed package `repository` from `node_modules/<package>/package.json`.
+4. Fallback to npm registry metadata.
+5. Fallback to GitHub repo extraction from npm README text.
+6. Fetch source from GitHub.
+7. If source is not found remotely, fail with a clear resolver error.
 
 ## Typical Errors and Meaning
 
 1. `Unsupported extension ...`
    - Extension not in allowed list.
 
-2. `Could not find ... commit hash`
-   - Lockfile missing or dependency entry missing.
+2. `Could not resolve source ...`
+   - Repository metadata/ref/path matching failed on remote GitHub source.
 
 3. Network / sandbox errors (for example DNS or blocked internet):
    - Environment blocked external GitHub calls.
@@ -162,6 +178,7 @@ fdk-file-fetcher-skill/
 ```
 
 For users:
+
 1. Clone repo.
 2. Keep script accessible from project root or update command path.
 3. Use agent prompt format from this README.
