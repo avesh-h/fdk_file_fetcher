@@ -48,6 +48,10 @@ function announce(message) {
   process.stderr.write(`[${SKILL_LABEL}] ${message}\n`);
 }
 
+function debug(message) {
+  process.stderr.write(`[${SKILL_LABEL}][debug] ${message}\n`);
+}
+
 function expectedInputFormat() {
   return [
     "Expected input format:",
@@ -341,8 +345,11 @@ async function resolveRepoAndRefs({
   let npmData = null;
   try {
     npmData = await fetchNpmMetadata(packageName);
-  } catch {
-    // ignore registry errors; fallback to local-only mode
+  } catch (err) {
+    debug(
+      `resolveRepoAndRefs:npmMetadataFailed package=${packageName} error=${err?.message || String(err)}`,
+    );
+    // ignore registry errors; fallback to local-only metadata sources
   }
 
   const latest = npmData?.["dist-tags"]?.latest;
@@ -372,14 +379,22 @@ async function resolveRepoAndRefs({
 
   repoInfo = repoCandidates.find(Boolean) || null;
 
-  if (!repoInfo) return null;
+  if (!repoInfo) {
+    debug(
+      `resolveRepoAndRefs:noRepoCandidate package=${packageName} manualRepo=${manualRepo || "none"}`,
+    );
+    return null;
+  }
 
   let defaultBranch = null;
   try {
     const meta = await githubRepoMeta(repoInfo.owner, repoInfo.repo, token);
     defaultBranch = meta?.default_branch || null;
-  } catch {
-    // ignore
+  } catch (err) {
+    debug(
+      `resolveRepoAndRefs:githubRepoMetaFailed repo=${repoInfo.owner}/${repoInfo.repo} error=${err?.message || String(err)}`,
+    );
+    // ignore and continue with fallback refs
   }
 
   const installedVersion = installedPkg?.version || null;
@@ -411,23 +426,36 @@ async function resolveFromGithub({
   sourcePrefix,
   token,
 }) {
-  if (!repoInfo) return null;
+  if (!repoInfo) {
+    debug("resolveFromGithub:skipped reason=noRepoInfo");
+    return null;
+  }
   for (const ref of repoInfo.refs) {
     try {
+      debug(`resolveFromGithub:tryingRef ref=${ref}`);
       const tree = await githubTree(repoInfo.owner, repoInfo.repo, ref, token);
+      debug(`resolveFromGithub:treeFetched ref=${ref} items=${tree.length}`);
       const targetPath = pickBestTreeFile(
         tree,
         packageFilePath,
         requestedExt,
         sourcePrefix,
       );
-      if (!targetPath) continue;
+      if (!targetPath) {
+        debug(
+          `resolveFromGithub:pathNotFound ref=${ref} wanted=${packageFilePath}`,
+        );
+        continue;
+      }
       const content = await githubGetRaw(
         repoInfo.owner,
         repoInfo.repo,
         targetPath,
         ref,
         token,
+      );
+      debug(
+        `resolveFromGithub:rawFetchSuccess ref=${ref} path=${targetPath} bytes=${content.length}`,
       );
       return {
         content,
@@ -437,10 +465,14 @@ async function resolveFromGithub({
         repo: repoInfo.repo,
         source: "github",
       };
-    } catch {
+    } catch (err) {
+      debug(
+        `resolveFromGithub:refFailed ref=${ref} error=${err?.message || String(err)}`,
+      );
       // try next ref
     }
   }
+  debug("resolveFromGithub:allRefsExhausted");
   return null;
 }
 
@@ -499,6 +531,7 @@ function printUsage() {
     "  --ref          Optional Git ref override (commit/tag/branch)",
     "  --prefer-latest Prefer npm latest metadata + main/master branch first",
     "  --source-prefix Optional source root preference (e.g. src)",
+    "  --output-format (chat mode only) raw | json (default: raw). Use json for agent parsing.",
     "  --github-token Optional GitHub token (or use GITHUB_TOKEN env)",
   ].join("\n");
   process.stdout.write(`${help}\n`);
@@ -570,14 +603,50 @@ async function main() {
   });
 
   if (!resolved) {
+    debug(
+      `main:finalFailure package=${packageName} importPath=${importPath} ext=${requestedExt || "auto"}`,
+    );
     fail(
-      `Could not resolve source for "${importPath}" from remote GitHub source for package "${packageName}".`,
+      [
+        `Could not resolve source for "${importPath}" from remote GitHub for package "${packageName}".`,
+        "",
+        "This script fetches only from GitHub (no local fallback). It requires network access to:",
+        "  - api.github.com",
+        "  - raw.githubusercontent.com",
+        "  - registry.npmjs.org (optional, for package metadata)",
+        "",
+        "If running in an automated or sandboxed environment (e.g. agent), ensure outbound network is allowed for this command, or run the script locally and use the output.",
+      ].join("\n"),
     );
   }
 
+  const chatOutputFormat =
+    stripQuotes(args["output-format"] || "").toLowerCase() || "raw";
+  const useJsonOutput = chatOutputFormat === "json";
+
   if (mode === "chat") {
-    announce("Returning source code in chat mode");
-    process.stdout.write(resolved.content);
+    announce(
+      useJsonOutput
+        ? "Returning source code in chat mode (JSON output)"
+        : "Returning source code in chat mode",
+    );
+    if (useJsonOutput) {
+      const payload = {
+        success: true,
+        content: resolved.content,
+        repoPath: resolved.repoPath,
+        ref: resolved.ref,
+        repo:
+          resolved.owner && resolved.repo
+            ? `${resolved.owner}/${resolved.repo}`
+            : resolved.repo,
+        packageName,
+        importPath,
+      };
+      process.stdout.write(JSON.stringify(payload));
+    } else {
+      process.stdout.write(resolved.content);
+    }
     return;
   }
 
